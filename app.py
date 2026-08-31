@@ -1,7 +1,12 @@
-"""WATERMARK TOOL - 이미지에 PNG 워터마크를 자동으로 합성하는 로컬 웹앱.
+"""WATERMARK TOOL - 이미지 리사이즈 · 톤/색감 보정 · PNG 워터마크를 한 화면에서 처리하는 로컬 웹앱.
 
-원본 이미지의 가로/세로 픽셀 크기는 절대 바꾸지 않습니다.
-(크롭/리사이즈 없음, 워터마크만 위에 합성)
+처리 순서는 항상 아래와 같으며, 워터마크는 언제나 마지막입니다.
+  1. EXIF orientation 보정
+  2. 크롭 / 리사이즈 (출력 캔버스에 맞춤)
+  3. 톤 보정
+  4. 색감 보정
+  5. 워터마크 합성   ← 보정 효과가 워터마크에 절대 적용되지 않음
+  6. 파일 저장
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ import json
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageOps
 
@@ -22,24 +28,57 @@ SUPPORTED_TYPES = ["jpg", "jpeg", "png", "webp"]
 JPEG_QUALITY = 95
 WEBP_QUALITY = 95
 PREVIEW_MAX_SIDE = 1100
+CACHE_PIXEL_LIMIT = 6_000_000        # 이보다 큰 캔버스는 캐시하지 않는다 (메모리 보호)
 
 DEFAULTS = {
-    "size_mode": "percent",       # "percent" | "pixel"
-    "size_percent": 16.0,         # 이미지 너비 대비 %
-    "size_px": 300,               # 워터마크 너비(px)
-    "opacity": 100,               # 0 ~ 100
+    # --- 출력 캔버스 ---
+    "canvas_mode": "preset",          # "preset"(1080×1440) | "custom" | "original"
+    "canvas_w": 1080,
+    "canvas_h": 1440,
+    "fit_mode": "crop",               # "crop"(Crop to Fill) | "fit" | "stretch"
+    "crop_anchor": "center",
+    "crop_x": 50.0,                   # 0=왼쪽, 100=오른쪽
+    "crop_y": 50.0,                   # 0=위,   100=아래
+    "bg_color": "#FFFFFF",
+
+    # --- 톤 보정 (전부 0 이면 원본 그대로) ---
+    "brightness": 0,
+    "exposure": 0,
+    "contrast": 0,
+    "highlights": 0,
+    "shadows": 0,
+
+    # --- 색감 보정 ---
+    "saturation": 0,
+    "temperature": 0,                 # 음수=차갑게, 양수=따뜻하게
+    "tint": 0,                        # 음수=green, 양수=magenta
+
+    # --- 워터마크 ---
+    "size_mode": "percent",           # "percent" | "pixel"
+    "size_percent": 16.0,             # 출력 캔버스 너비 대비 %
+    "size_px": 300,
+    "opacity": 70,                    # 0 ~ 100
     "position": "bottom_right",
-    "margin_mode": "percent",     # "percent" | "pixel"
+    "margin_mode": "percent",         # "percent" | "pixel"
     "margin_x_percent": 2.5,
     "margin_y_percent": 2.0,
     "margin_x_px": 24,
     "margin_y_px": 24,
-    "custom_unit": "percent",     # "percent" | "pixel"
+    "custom_unit": "percent",         # "percent" | "pixel"
     "custom_x_percent": 78.0,
     "custom_y_percent": 88.0,
     "custom_x_px": 0,
     "custom_y_px": 0,
+
+    # --- 저장 ---
+    "output_format": "jpeg",          # "jpeg" | "keep"(원본 형식 유지)
+    "name_suffix": "_edited",
 }
+
+ADJUSTMENT_KEYS = (
+    "brightness", "exposure", "contrast", "highlights", "shadows",
+    "saturation", "temperature", "tint",
+)
 
 POSITION_LABELS = {
     "top_left": "왼쪽 위",
@@ -50,6 +89,25 @@ POSITION_LABELS = {
     "custom": "사용자 지정 (X / Y 직접 입력)",
 }
 POSITION_KEYS = list(POSITION_LABELS)
+
+FIT_LABELS = {
+    "crop": "Crop to Fill · 비율 유지 + 넘치는 부분만 자름 (권장)",
+    "fit": "Fit · 전체가 보이도록 맞추고 남는 곳은 배경색",
+    "stretch": "Stretch · 강제로 늘림 (비율 깨짐)",
+}
+FIT_KEYS = list(FIT_LABELS)
+
+CANVAS_LABELS = {
+    "preset": "1080 × 1440 px (3:4)",
+    "custom": "직접 입력",
+    "original": "원본 크기 그대로",
+}
+CANVAS_KEYS = list(CANVAS_LABELS)
+
+CROP_ANCHOR_LABELS = {"center": "중앙", "top": "상단", "bottom": "하단", "left": "좌측", "right": "우측"}
+CROP_ANCHOR_KEYS = list(CROP_ANCHOR_LABELS)
+CROP_ANCHOR_POS = {"center": (50.0, 50.0), "top": (50.0, 0.0), "bottom": (50.0, 100.0),
+                   "left": (0.0, 50.0), "right": (100.0, 50.0)}
 
 MIME_BY_FORMAT = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
 
@@ -76,8 +134,20 @@ def _as_choice(value, choices, fallback):
     return value if value in choices else fallback
 
 
+def _as_hex_color(value, fallback):
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) == 7 and text.startswith("#"):
+            try:
+                int(text[1:], 16)
+                return text.upper()
+            except ValueError:
+                pass
+    return fallback
+
+
 def load_config() -> dict:
-    """config.json 을 읽어 이전 설정을 복원한다. 없거나 깨졌으면 기본값."""
+    """config.json 을 읽어 이전 설정을 복원한다. 없거나 깨졌으면 항목별로 기본값."""
     raw = {}
     if CONFIG_PATH.exists():
         try:
@@ -88,7 +158,16 @@ def load_config() -> dict:
             raw = {}
 
     d = DEFAULTS
-    return {
+    config = {
+        "canvas_mode": _as_choice(raw.get("canvas_mode"), tuple(CANVAS_KEYS), d["canvas_mode"]),
+        "canvas_w": _as_int(raw.get("canvas_w"), d["canvas_w"], 16, 10000),
+        "canvas_h": _as_int(raw.get("canvas_h"), d["canvas_h"], 16, 10000),
+        "fit_mode": _as_choice(raw.get("fit_mode"), tuple(FIT_KEYS), d["fit_mode"]),
+        "crop_anchor": _as_choice(raw.get("crop_anchor"), tuple(CROP_ANCHOR_KEYS), d["crop_anchor"]),
+        "crop_x": _as_float(raw.get("crop_x"), d["crop_x"], 0.0, 100.0),
+        "crop_y": _as_float(raw.get("crop_y"), d["crop_y"], 0.0, 100.0),
+        "bg_color": _as_hex_color(raw.get("bg_color"), d["bg_color"]),
+
         "size_mode": _as_choice(raw.get("size_mode"), ("percent", "pixel"), d["size_mode"]),
         "size_percent": _as_float(raw.get("size_percent"), d["size_percent"], 1.0, 100.0),
         "size_px": _as_int(raw.get("size_px"), d["size_px"], 1, 20000),
@@ -104,20 +183,27 @@ def load_config() -> dict:
         "custom_y_percent": _as_float(raw.get("custom_y_percent"), d["custom_y_percent"], -100.0, 200.0),
         "custom_x_px": _as_int(raw.get("custom_x_px"), d["custom_x_px"], -20000, 20000),
         "custom_y_px": _as_int(raw.get("custom_y_px"), d["custom_y_px"], -20000, 20000),
+
+        "output_format": _as_choice(raw.get("output_format"), ("jpeg", "keep"), d["output_format"]),
+        "name_suffix": str(raw.get("name_suffix", d["name_suffix"]))[:40] or d["name_suffix"],
     }
+    for key in ADJUSTMENT_KEYS:
+        config[key] = _as_int(raw.get(key), d[key], -100, 100)
+    return config
 
 
 def save_config(config: dict) -> bool:
     try:
+        ordered = {key: config[key] for key in DEFAULTS if key in config}
         CONFIG_PATH.write_text(
-            json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            json.dumps(ordered, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         return True
     except OSError:
         return False
 
 
-# ---------------------------------------------------------------- 이미지 처리
+# ---------------------------------------------------------------- 1단계: 디코드 + EXIF
 
 def open_image(data: bytes) -> Image.Image:
     image = Image.open(io.BytesIO(data))
@@ -130,6 +216,161 @@ def normalize_orientation(image: Image.Image) -> Image.Image:
     return ImageOps.exif_transpose(image)
 
 
+def read_source(data: bytes) -> tuple[Image.Image, dict]:
+    """업로드 바이트 → (EXIF 보정된 RGBA 이미지, 원본 메타데이터)."""
+    with open_image(data) as opened:
+        source_format = (opened.format or "PNG").upper()
+        oriented = normalize_orientation(opened)
+        meta = {
+            "source_format": "JPEG" if source_format == "MPO" else source_format,
+            "mode": opened.mode,
+            "has_alpha": opened.mode in ("RGBA", "LA", "PA") or "transparency" in opened.info,
+            "icc_profile": opened.info.get("icc_profile"),
+            "size": oriented.size,
+        }
+    meta["exif"] = oriented.info.get("exif")
+    return oriented.convert("RGBA"), meta
+
+
+# ---------------------------------------------------------------- 2단계: 크롭 / 리사이즈
+
+def hex_to_rgb(value: str) -> tuple[int, int, int]:
+    text = value.lstrip("#")
+    return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def target_canvas(config: dict, source_size: tuple[int, int]) -> tuple[int, int]:
+    if config["canvas_mode"] == "original":
+        return source_size
+    if config["canvas_mode"] == "custom":
+        return int(config["canvas_w"]), int(config["canvas_h"])
+    return DEFAULTS["canvas_w"], DEFAULTS["canvas_h"]
+
+
+def fit_to_canvas(source: Image.Image, canvas_w: int, canvas_h: int, config: dict) -> Image.Image:
+    """정확히 canvas_w × canvas_h 픽셀의 RGBA 이미지를 돌려준다."""
+    source_w, source_h = source.size
+    if (source_w, source_h) == (canvas_w, canvas_h):
+        return source
+
+    background = hex_to_rgb(config["bg_color"])
+    mode = config["fit_mode"]
+
+    if mode == "stretch":
+        return source.resize((canvas_w, canvas_h), Image.LANCZOS)
+
+    if mode == "fit":
+        scale = min(canvas_w / source_w, canvas_h / source_h)
+        new_w = max(1, min(canvas_w, round(source_w * scale)))
+        new_h = max(1, min(canvas_h, round(source_h * scale)))
+        scaled = source.resize((new_w, new_h), Image.LANCZOS)
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), background + (255,))
+        canvas.paste(scaled, ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2), scaled)
+        return canvas
+
+    # Crop to Fill: 캔버스를 꽉 채운 뒤 넘치는 부분만 잘라낸다.
+    scale = max(canvas_w / source_w, canvas_h / source_h)
+    new_w = max(canvas_w, round(source_w * scale))
+    new_h = max(canvas_h, round(source_h * scale))
+    scaled = source.resize((new_w, new_h), Image.LANCZOS)
+    left = int(round((new_w - canvas_w) * config["crop_x"] / 100.0))
+    top = int(round((new_h - canvas_h) * config["crop_y"] / 100.0))
+    left = min(max(left, 0), new_w - canvas_w)
+    top = min(max(top, 0), new_h - canvas_h)
+    return scaled.crop((left, top, left + canvas_w, top + canvas_h))
+
+
+# ---------------------------------------------------------------- 3·4단계: 톤 / 색감 보정
+
+def has_adjustments(config: dict) -> bool:
+    return any(int(config[key]) != 0 for key in ADJUSTMENT_KEYS)
+
+
+def _smoothstep(edge0: float, edge1: float, values: np.ndarray) -> np.ndarray:
+    t = np.clip((values - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _luma(rgb: np.ndarray) -> np.ndarray:
+    return rgb[..., 0:1] * 0.2126 + rgb[..., 1:2] * 0.7152 + rgb[..., 2:3] * 0.0722
+
+
+def adjust_image(image: Image.Image, config: dict) -> Image.Image:
+    """톤·색감 보정. 모든 값이 0이면 원본 객체를 그대로 돌려준다(무손실 통과)."""
+    if not has_adjustments(config):
+        return image
+
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    rgb = array[..., :3].copy()
+    alpha = array[..., 3:]
+
+    # 노출 - 선형 광량 공간에서 스톱 단위로 곱한다 (±1.5 스톱)
+    exposure = float(config["exposure"]) / 100.0
+    if exposure:
+        linear = np.power(np.clip(rgb, 0.0, 1.0), 2.2)
+        linear *= float(2.0 ** (exposure * 1.5))
+        rgb = np.power(np.clip(linear, 0.0, None), 1.0 / 2.2)
+
+    # 밝기 - 감마로 중간톤만 올려 하이라이트가 타지 않게 한다
+    brightness = float(config["brightness"]) / 100.0
+    if brightness:
+        rgb = np.power(np.clip(rgb, 0.0, 1.0), 1.0 / (1.0 + 0.7 * brightness))
+
+    # 대비 - 중간 회색(0.5) 기준
+    contrast = float(config["contrast"]) / 100.0
+    if contrast:
+        rgb = (rgb - 0.5) * (1.0 + 0.65 * contrast) + 0.5
+
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    # 하이라이트 - 밝은 영역에만 부드럽게 (smoothstep 마스크라 경계가 생기지 않는다)
+    highlights = float(config["highlights"]) / 100.0
+    if highlights:
+        mask = _smoothstep(0.45, 1.0, _luma(rgb))
+        if highlights > 0:
+            rgb = rgb + highlights * 0.45 * mask * (1.0 - rgb)
+        else:
+            rgb = rgb * (1.0 + highlights * 0.60 * mask)
+
+    # 그림자 - 어두운 영역에만
+    shadows = float(config["shadows"]) / 100.0
+    if shadows:
+        mask = 1.0 - _smoothstep(0.0, 0.55, _luma(rgb))
+        if shadows > 0:
+            rgb = rgb + shadows * 0.50 * mask * (1.0 - rgb)
+        else:
+            rgb = rgb * (1.0 + shadows * 0.70 * mask)
+
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    # 채도
+    saturation = float(config["saturation"]) / 100.0
+    if saturation:
+        gray = _luma(rgb)
+        rgb = gray + (rgb - gray) * (1.0 + saturation)
+        rgb = np.clip(rgb, 0.0, 1.0)
+
+    # 색온도 / Tint - 채널 게인을 준 뒤 밝기를 되돌려 톤이 밀리지 않게 한다
+    temperature = float(config["temperature"]) / 100.0
+    tint = float(config["tint"]) / 100.0
+    if temperature or tint:
+        before = _luma(rgb)
+        gain = np.array([
+            1.0 + 0.18 * temperature + 0.06 * tint,
+            1.0 - 0.10 * tint,
+            1.0 - 0.18 * temperature + 0.06 * tint,
+        ], dtype=np.float32)
+        rgb = np.clip(rgb * gain, 0.0, 1.0)
+        after = _luma(rgb)
+        rgb = rgb * (before / np.maximum(after, 1e-4))
+
+    rgb = np.clip(rgb, 0.0, 1.0)
+    merged = np.concatenate([rgb, alpha], axis=-1)
+    return Image.fromarray((merged * 255.0 + 0.5).astype(np.uint8), mode="RGBA")
+
+
+# ---------------------------------------------------------------- 5단계: 워터마크 합성
+
 def watermark_target_size(base_w: int, wm_w: int, wm_h: int, config: dict) -> tuple[int, int]:
     if config["size_mode"] == "percent":
         target_w = base_w * config["size_percent"] / 100.0
@@ -141,7 +382,7 @@ def watermark_target_size(base_w: int, wm_w: int, wm_h: int, config: dict) -> tu
 
 
 def watermark_position(base_w: int, base_h: int, wm_w: int, wm_h: int, config: dict) -> tuple[int, int]:
-    """워터마크 왼쪽 위 모서리가 놓일 좌표를 계산한다."""
+    """워터마크 왼쪽 위 모서리가 놓일 좌표. 기준은 항상 최종 출력 캔버스."""
     position = config["position"]
 
     if position == "custom":
@@ -184,7 +425,7 @@ def apply_opacity(watermark: Image.Image, opacity: int) -> Image.Image:
 
 
 def compose(base: Image.Image, watermark: Image.Image, config: dict) -> Image.Image:
-    """원본과 동일한 픽셀 크기의 RGBA 결과를 돌려준다."""
+    """보정이 모두 끝난 캔버스 위에 워터마크만 얹는다. 캔버스 크기는 변하지 않는다."""
     base_w, base_h = base.size
     wm_w, wm_h = watermark.size
 
@@ -195,69 +436,110 @@ def compose(base: Image.Image, watermark: Image.Image, config: dict) -> Image.Im
     x, y = watermark_position(base_w, base_h, target_w, target_h, config)
 
     layer = Image.new("RGBA", (base_w, base_h), (0, 0, 0, 0))
-    layer.paste(resized, (x, y))          # 이미지 밖으로 나가는 부분은 자동으로 잘림
-    return Image.alpha_composite(base.convert("RGBA"), layer)
+    layer.paste(resized, (x, y))          # 캔버스 밖으로 나가는 부분은 자동으로 잘림
+    return Image.alpha_composite(base, layer)
 
 
-def encode_image(result: Image.Image, source: Image.Image, out_format: str, source_format: str) -> bytes:
-    """색상 프로파일(ICC)과 EXIF 를 가능한 한 유지한 채 저장한다."""
-    source_mode = source.mode
-    has_alpha = source_mode in ("RGBA", "LA", "PA") or "transparency" in source.info
+# ---------------------------------------------------------------- 6단계: 저장
+
+def flatten(image: Image.Image, background: tuple[int, int, int]) -> Image.Image:
+    canvas = Image.new("RGBA", image.size, background + (255,))
+    return Image.alpha_composite(canvas, image).convert("RGB")
+
+
+def encode_image(result: Image.Image, meta: dict, config: dict, resized: bool) -> tuple[bytes, str]:
+    """색상 프로파일을 가능한 한 유지한 채 저장한다. (bytes, 저장 포맷) 반환."""
+    if config["output_format"] == "jpeg":
+        out_format = "JPEG"
+    else:
+        out_format = meta["source_format"] if meta["source_format"] in MIME_BY_FORMAT else "PNG"
 
     save_kwargs: dict = {}
-    icc_profile = source.info.get("icc_profile")
+    icc_profile = meta.get("icc_profile")
     # CMYK/LAB 등은 RGB 로 바뀌므로 원본 프로파일을 그대로 붙이면 색이 틀어진다.
-    if icc_profile and source_mode not in ("CMYK", "LAB", "YCbCr"):
+    if icc_profile and meta["mode"] not in ("CMYK", "LAB", "YCbCr"):
         save_kwargs["icc_profile"] = icc_profile
 
-    exif = source.info.get("exif")   # orientation 은 이미 제거된 상태
+    # 크기가 바뀐 이미지에 원본 EXIF(썸네일·치수 포함)를 붙이면 정보가 어긋나므로 뺀다.
+    exif = None if resized else meta.get("exif")
+    background = hex_to_rgb(config["bg_color"])
 
     if out_format == "JPEG":
-        image = result.convert("RGB")
-        # "keep" = 원본 JPEG 의 크로마 서브샘플링을 그대로 유지 (재인코딩 손실 최소화)
-        save_kwargs.update(quality=JPEG_QUALITY, subsampling="keep" if source_format == "JPEG" else 0)
+        image = flatten(result, background)
+        save_kwargs.update(
+            quality=JPEG_QUALITY,
+            subsampling="keep" if (meta["source_format"] == "JPEG" and not resized) else 0,
+        )
         if exif:
             save_kwargs["exif"] = exif
     elif out_format == "WEBP":
-        image = result if has_alpha else result.convert("RGB")
+        image = result if meta["has_alpha"] else flatten(result, background)
         save_kwargs.update(quality=WEBP_QUALITY, method=6)
         if exif:
             save_kwargs["exif"] = exif
     else:  # PNG
-        image = result if has_alpha else result.convert("RGB")
+        image = result if meta["has_alpha"] else flatten(result, background)
 
     buffer = io.BytesIO()
     try:
         image.save(buffer, format=out_format, **save_kwargs)
     except (OSError, ValueError):
-        # subsampling="keep" 등 원본 의존 옵션이 거부되면 안전한 기본값으로 재시도
+        # 원본 의존 옵션이 거부되면 안전한 기본값으로 재시도해 파일은 반드시 만들어 낸다.
         buffer = io.BytesIO()
         save_kwargs.pop("subsampling", None)
         save_kwargs.pop("exif", None)
         image.save(buffer, format=out_format, **save_kwargs)
-    return buffer.getvalue()
+    return buffer.getvalue(), out_format
 
 
-def output_name(filename: str) -> str:
+def output_name(filename: str, out_format: str, suffix: str) -> str:
     path = Path(filename)
-    return f"{path.stem}_watermarked{path.suffix}"
+    extension = ".jpg" if out_format == "JPEG" else (path.suffix or ".png")
+    return f"{path.stem}{suffix}{extension}"
 
 
-def process_one(data: bytes, filename: str, watermark: Image.Image, config: dict) -> dict:
-    with open_image(data) as opened:
-        source = normalize_orientation(opened)
-        source_format = (opened.format or "PNG").upper()
+# ---------------------------------------------------------------- 파이프라인
 
-    out_format = "JPEG" if source_format == "MPO" else source_format   # 일부 카메라 JPG
+def _prepare_canvas(data: bytes, config: dict) -> tuple[Image.Image, dict, tuple[int, int]]:
+    source, meta = read_source(data)                              # 1. EXIF
+    canvas_w, canvas_h = target_canvas(config, source.size)
+    canvas = fit_to_canvas(source, canvas_w, canvas_h, config)    # 2. 크롭/리사이즈
+    return canvas, meta, source.size
 
-    result = compose(source, watermark, config)
-    payload = encode_image(result, source, out_format, source_format)
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _prepare_canvas_cached(data: bytes, canvas_key: tuple):
+    config = dict(DEFAULTS)
+    (config["canvas_mode"], config["canvas_w"], config["canvas_h"],
+     config["fit_mode"], config["crop_x"], config["crop_y"], config["bg_color"]) = canvas_key
+    canvas, meta, source_size = _prepare_canvas(data, config)
+    return canvas.tobytes(), canvas.size, meta, source_size
+
+
+def prepare_canvas(data: bytes, config: dict) -> tuple[Image.Image, dict, tuple[int, int]]:
+    """1~2단계. 슬라이더를 움직일 때마다 다시 디코딩하지 않도록 캐시한다."""
+    canvas_key = (config["canvas_mode"], int(config["canvas_w"]), int(config["canvas_h"]),
+                  config["fit_mode"], float(config["crop_x"]), float(config["crop_y"]),
+                  config["bg_color"])
+    if config["canvas_mode"] != "original" and \
+            int(config["canvas_w"]) * int(config["canvas_h"]) <= CACHE_PIXEL_LIMIT:
+        raw, size, meta, source_size = _prepare_canvas_cached(data, canvas_key)
+        return Image.frombytes("RGBA", size, raw), meta, source_size
+    return _prepare_canvas(data, config)
+
+
+def process_one(data: bytes, filename: str, watermark: Image.Image | None, config: dict) -> dict:
+    """한 장을 정해진 순서대로 처리한다."""
+    canvas, meta, source_size = prepare_canvas(data, config)      # 1 · 2
+    edited = adjust_image(canvas, config)                         # 3 · 4
+    result = compose(edited, watermark, config) if watermark is not None else edited   # 5
+    payload, out_format = encode_image(result, meta, config, resized=canvas.size != source_size)
 
     return {
-        "name": output_name(filename),
+        "name": output_name(filename, out_format, config["name_suffix"]),
         "bytes": payload,
         "mime": MIME_BY_FORMAT.get(out_format, "application/octet-stream"),
-        "source_size": source.size,
+        "source_size": source_size,
         "result_size": result.size,
         "image": result,
     }
@@ -265,35 +547,215 @@ def process_one(data: bytes, filename: str, watermark: Image.Image, config: dict
 
 def make_zip(results: list[dict]) -> bytes:
     buffer = io.BytesIO()
+    used: dict[str, int] = {}
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for item in results:
-            archive.writestr(item["name"], item["bytes"])
+            name = item["name"]
+            if name in used:                                      # 같은 이름이 겹치면 번호를 붙인다
+                used[name] += 1
+                path = Path(name)
+                name = f"{path.stem}_{used[name]}{path.suffix}"
+            else:
+                used[name] = 0
+            archive.writestr(name, item["bytes"])
     return buffer.getvalue()
 
 
-def to_preview(image: Image.Image) -> Image.Image:
+def to_preview(image: Image.Image, max_side: int = PREVIEW_MAX_SIDE) -> Image.Image:
     """화면 표시용 축소본 (저장되는 파일과는 무관)."""
     preview = image.copy()
-    preview.thumbnail((PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE), Image.LANCZOS)
+    preview.thumbnail((max_side, max_side), Image.LANCZOS)
     return preview
 
 
 # ---------------------------------------------------------------- 화면
+#
+# 설정의 유일한 진실은 st.session_state.settings (평범한 dict) 이고,
+# 위젯에는 value= / index= 로 넣어 준다. 위젯 키는 "w_" 접두사를 붙여 분리한다.
+# 이렇게 하면 조건에 따라 잠깐 사라지는 위젯(크롭 슬라이더 등)의 값이 초기화되지 않는다.
 
 st.set_page_config(page_title="WATERMARK TOOL", page_icon="💧", layout="centered")
 
 st.title("WATERMARK TOOL")
-st.caption("이미지 크기는 그대로, 워터마크만 얹어 드립니다.")
+st.caption("크기 맞추기 → 톤·색감 보정 → 워터마크. 워터마크는 항상 마지막에 얹혀 보정의 영향을 받지 않습니다.")
 
-if "config" not in st.session_state:
-    st.session_state.config = load_config()
-saved_config = st.session_state.config
+if "settings" not in st.session_state:
+    st.session_state.settings = load_config()
+    st.session_state.last_saved = dict(st.session_state.settings)
+settings = st.session_state.settings
 
-# 1) 워터마크 PNG ------------------------------------------------------------
-st.subheader("1. 워터마크 PNG 선택")
+
+def reset_adjustments() -> None:
+    for key in ADJUSTMENT_KEYS:
+        st.session_state.settings[key] = 0
+        st.session_state["w_" + key] = 0
+
+
+def sync_crop_anchor() -> None:
+    anchor = st.session_state["w_crop_anchor"]
+    x, y = CROP_ANCHOR_POS[anchor]
+    st.session_state.settings["crop_anchor"] = anchor
+    st.session_state.settings["crop_x"] = x
+    st.session_state.settings["crop_y"] = y
+    st.session_state["w_crop_x"] = x
+    st.session_state["w_crop_y"] = y
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def peek_size(data: bytes) -> tuple[int, int]:
+    """EXIF 회전까지 반영한 원본 크기를 전체 디코딩 없이 알아낸다."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            orientation = image.getexif().get(274, 1)
+    except OSError:
+        return (0, 0)
+    if orientation in (5, 6, 7, 8):
+        width, height = height, width
+    return (width, height)
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def original_thumbnail(data: bytes) -> tuple[bytes, tuple[int, int]]:
+    source, _meta = read_source(data)
+    thumbnail = to_preview(source, 760)
+    return thumbnail.tobytes(), thumbnail.size
+
+
+# ---------------------------------------------------------------- 1. 이미지 업로드
+st.subheader("1. 이미지 업로드")
+uploaded_images = st.file_uploader(
+    "JPG / JPEG / PNG / WEBP · 여러 장을 한 번에 끌어다 놓으세요",
+    type=SUPPORTED_TYPES,
+    accept_multiple_files=True,
+    key="w_image_files",
+)
+
+if uploaded_images:
+    rows = []
+    for file in uploaded_images:
+        width, height = peek_size(file.getvalue())
+        rows.append({
+            "파일 이름": file.name,
+            "원본 크기": f"{width} × {height} px" if width else "읽을 수 없음",
+            "비율": f"{width / height:.2f} : 1" if width and height else "-",
+        })
+    st.dataframe(rows, hide_index=True, width="stretch")
+else:
+    st.info("이미지를 올리면 여기에 목록과 원본 크기가 표시됩니다.")
+
+
+# ---------------------------------------------------------------- 2. 출력 사이즈
+st.subheader("2. 출력 사이즈")
+
+settings["canvas_mode"] = st.selectbox(
+    "출력 크기",
+    CANVAS_KEYS,
+    index=CANVAS_KEYS.index(settings["canvas_mode"]),
+    format_func=lambda key: CANVAS_LABELS[key],
+    key="w_canvas_mode",
+)
+
+if settings["canvas_mode"] == "custom":
+    size_col1, size_col2 = st.columns(2)
+    with size_col1:
+        settings["canvas_w"] = st.number_input(
+            "가로 (px)", 16, 10000, value=int(settings["canvas_w"]), step=10, key="w_canvas_w")
+    with size_col2:
+        settings["canvas_h"] = st.number_input(
+            "세로 (px)", 16, 10000, value=int(settings["canvas_h"]), step=10, key="w_canvas_h")
+
+if settings["canvas_mode"] == "original":
+    st.caption("원본 크기를 그대로 유지합니다. 크롭·리사이즈 없이 보정과 워터마크만 적용됩니다.")
+else:
+    settings["fit_mode"] = st.radio(
+        "맞추는 방식",
+        FIT_KEYS,
+        index=FIT_KEYS.index(settings["fit_mode"]),
+        format_func=lambda key: FIT_LABELS[key],
+        key="w_fit_mode",
+    )
+
+    if settings["fit_mode"] == "crop":
+        settings["crop_anchor"] = st.selectbox(
+            "크롭 기준점",
+            CROP_ANCHOR_KEYS,
+            index=CROP_ANCHOR_KEYS.index(settings["crop_anchor"]),
+            format_func=lambda key: CROP_ANCHOR_LABELS[key],
+            key="w_crop_anchor",
+            on_change=sync_crop_anchor,
+            help="기준점을 고르면 아래 위치 슬라이더가 그 자리로 맞춰집니다. 이후 슬라이더로 미세 조정할 수 있습니다.",
+        )
+        crop_col1, crop_col2 = st.columns(2)
+        with crop_col1:
+            settings["crop_x"] = st.slider(
+                "좌우 위치 (0 = 왼쪽, 100 = 오른쪽)", 0.0, 100.0,
+                value=float(settings["crop_x"]), step=1.0, key="w_crop_x")
+        with crop_col2:
+            settings["crop_y"] = st.slider(
+                "상하 위치 (0 = 위, 100 = 아래)", 0.0, 100.0,
+                value=float(settings["crop_y"]), step=1.0, key="w_crop_y")
+        st.caption("가로가 남는 사진은 좌우 슬라이더가, 세로가 남는 사진은 상하 슬라이더가 움직입니다.")
+    elif settings["fit_mode"] == "fit":
+        settings["bg_color"] = st.color_picker(
+            "남는 영역 배경색", value=settings["bg_color"], key="w_bg_color")
+    else:
+        st.warning("Stretch 는 원본 비율을 무시하고 늘립니다. 인물·상품 사진에는 권장하지 않습니다.")
+
+with st.expander("저장 옵션 (파일 형식 · 이름)"):
+    settings["output_format"] = st.radio(
+        "저장 형식",
+        ["jpeg", "keep"],
+        index=["jpeg", "keep"].index(settings["output_format"]),
+        format_func=lambda key: "JPG (quality 95)" if key == "jpeg" else "원본 형식 유지 (JPG/PNG/WEBP)",
+        key="w_output_format",
+        horizontal=True,
+    )
+    suffix = st.text_input("파일 이름 뒤에 붙일 말", value=settings["name_suffix"],
+                           max_chars=40, key="w_name_suffix")
+    settings["name_suffix"] = suffix.replace("/", "").replace("\\", "").strip() or "_edited"
+    st.caption(f"예) `사진.jpg` → `사진{settings['name_suffix']}.jpg`")
+
+
+# ---------------------------------------------------------------- 3. 톤 보정
+st.subheader("3. 톤 보정")
+st.caption("모든 값이 0이면 원본 픽셀이 전혀 바뀌지 않습니다.")
+
+
+def adjustment_slider(label: str, key: str, help_text: str | None = None) -> None:
+    settings[key] = st.slider(label, -100, 100, value=int(settings[key]),
+                              key="w_" + key, help=help_text)
+
+
+tone_col1, tone_col2 = st.columns(2)
+with tone_col1:
+    adjustment_slider("밝기 Brightness", "brightness")
+    adjustment_slider("노출 Exposure", "exposure")
+    adjustment_slider("대비 Contrast", "contrast")
+with tone_col2:
+    adjustment_slider("하이라이트 Highlights", "highlights", "하늘처럼 밝은 부분만 조절합니다.")
+    adjustment_slider("그림자 Shadows", "shadows", "얼굴처럼 어두운 부분만 조절합니다.")
+
+
+# ---------------------------------------------------------------- 4. 색감 보정
+st.subheader("4. 색감 보정")
+
+color_col1, color_col2 = st.columns(2)
+with color_col1:
+    adjustment_slider("채도 Saturation", "saturation")
+    adjustment_slider("색온도 Temperature", "temperature", "음수 = 차갑게(파랑), 양수 = 따뜻하게(주황)")
+with color_col2:
+    adjustment_slider("Tint", "tint", "음수 = Green, 양수 = Magenta")
+    st.write("")
+    st.button("보정 초기화", on_click=reset_adjustments, width="stretch",
+              help="톤·색감 값을 모두 0으로 되돌립니다.")
+
+
+# ---------------------------------------------------------------- 5. 워터마크
+st.subheader("5. 워터마크")
 
 uploaded_watermark = st.file_uploader(
-    "워터마크로 쓸 투명 배경 PNG 파일", type=["png"], key="watermark_file"
+    "워터마크로 쓸 투명 배경 PNG 파일", type=["png"], key="w_watermark_file"
 )
 
 watermark_image = None
@@ -313,171 +775,153 @@ elif DEFAULT_WATERMARK_PATH.exists():
     except OSError:
         st.error("`watermark.png` 파일을 읽을 수 없습니다. 위에서 다른 PNG 를 올려 주세요.")
 else:
-    st.warning("워터마크 PNG 를 올려 주세요. (또는 앱 폴더에 `watermark.png` 를 넣어 두세요)")
+    st.warning("워터마크 PNG 가 없습니다. 이대로 진행하면 보정만 적용되고 워터마크는 들어가지 않습니다.")
 
 if watermark_image is not None:
-    st.image(to_preview(watermark_image), caption="선택된 워터마크", width=220)
+    st.image(to_preview(watermark_image, 320), caption="선택된 워터마크", width=220)
 
-# 2) 이미지 업로드 -----------------------------------------------------------
-st.subheader("2. 이미지 업로드")
-uploaded_images = st.file_uploader(
-    "JPG / JPEG / PNG / WEBP · 여러 장을 한 번에 끌어다 놓으세요",
-    type=SUPPORTED_TYPES,
-    accept_multiple_files=True,
-    key="image_files",
-)
-if uploaded_images:
-    st.caption(f"{len(uploaded_images)}장 선택됨")
-
-# 3) 설정 --------------------------------------------------------------------
-st.subheader("3. 워터마크 설정")
-
-size_col, opacity_col = st.columns(2)
-with size_col:
-    size_mode_label = st.radio(
+wm_col1, wm_col2 = st.columns(2)
+with wm_col1:
+    settings["size_mode"] = st.radio(
         "워터마크 크기 기준",
-        ["이미지 너비 대비 %", "픽셀(px)"],
-        index=0 if saved_config["size_mode"] == "percent" else 1,
+        ["percent", "pixel"],
+        index=["percent", "pixel"].index(settings["size_mode"]),
+        format_func=lambda key: "출력 이미지 너비 대비 %" if key == "percent" else "픽셀(px)",
+        key="w_size_mode",
         horizontal=True,
-        key="size_mode_label",
     )
-    size_mode = "percent" if size_mode_label.startswith("이미지") else "pixel"
-    if size_mode == "percent":
-        size_percent = st.slider(
-            "워터마크 크기 (이미지 너비의 %)", 1.0, 100.0,
-            float(saved_config["size_percent"]), 0.5, key="size_percent",
-        )
-        size_px = saved_config["size_px"]
+    if settings["size_mode"] == "percent":
+        settings["size_percent"] = st.slider(
+            "워터마크 크기 (출력 너비의 %)", 1.0, 100.0,
+            value=float(settings["size_percent"]), step=0.5, key="w_size_percent")
     else:
-        size_px = st.number_input(
-            "워터마크 너비 (px)", 1, 20000, int(saved_config["size_px"]), 10, key="size_px",
-        )
-        size_percent = saved_config["size_percent"]
+        settings["size_px"] = st.number_input(
+            "워터마크 너비 (px)", 1, 20000, value=int(settings["size_px"]), step=10, key="w_size_px")
+with wm_col2:
+    settings["opacity"] = st.slider(
+        "워터마크 투명도 (%)", 0, 100, value=int(settings["opacity"]), key="w_opacity",
+        help="100 = 원본 PNG 그대로, 0 = 완전히 투명")
 
-with opacity_col:
-    opacity = st.slider(
-        "워터마크 투명도 (%)", 0, 100, int(saved_config["opacity"]), 1, key="opacity",
-        help="100 = 원본 PNG 그대로, 0 = 완전히 투명",
-    )
-
-position = st.selectbox(
+settings["position"] = st.selectbox(
     "워터마크 위치",
     POSITION_KEYS,
-    index=POSITION_KEYS.index(saved_config["position"]),
+    index=POSITION_KEYS.index(settings["position"]),
     format_func=lambda key: POSITION_LABELS[key],
-    key="position",
+    key="w_position",
 )
 
-custom_unit = saved_config["custom_unit"]
-custom_x_percent, custom_y_percent = saved_config["custom_x_percent"], saved_config["custom_y_percent"]
-custom_x_px, custom_y_px = saved_config["custom_x_px"], saved_config["custom_y_px"]
-margin_mode = saved_config["margin_mode"]
-margin_x_percent, margin_y_percent = saved_config["margin_x_percent"], saved_config["margin_y_percent"]
-margin_x_px, margin_y_px = saved_config["margin_x_px"], saved_config["margin_y_px"]
-
-if position == "custom":
-    custom_unit_label = st.radio(
+if settings["position"] == "custom":
+    settings["custom_unit"] = st.radio(
         "X / Y 입력 방식",
-        ["백분율(%)", "픽셀(px)"],
-        index=0 if custom_unit == "percent" else 1,
+        ["percent", "pixel"],
+        index=["percent", "pixel"].index(settings["custom_unit"]),
+        format_func=lambda key: "백분율(%)" if key == "percent" else "픽셀(px)",
+        key="w_custom_unit",
         horizontal=True,
-        key="custom_unit_label",
     )
-    custom_unit = "percent" if custom_unit_label.startswith("백분율") else "pixel"
-    x_col, y_col = st.columns(2)
-    if custom_unit == "percent":
-        with x_col:
-            custom_x_percent = st.number_input(
-                "X (이미지 너비의 %)", -100.0, 200.0, float(custom_x_percent), 0.5, key="custom_x_percent")
-        with y_col:
-            custom_y_percent = st.number_input(
-                "Y (이미지 높이의 %)", -100.0, 200.0, float(custom_y_percent), 0.5, key="custom_y_percent")
+    xy_col1, xy_col2 = st.columns(2)
+    if settings["custom_unit"] == "percent":
+        with xy_col1:
+            settings["custom_x_percent"] = st.number_input(
+                "X (출력 너비의 %)", -100.0, 200.0,
+                value=float(settings["custom_x_percent"]), step=0.5, key="w_custom_x_percent")
+        with xy_col2:
+            settings["custom_y_percent"] = st.number_input(
+                "Y (출력 높이의 %)", -100.0, 200.0,
+                value=float(settings["custom_y_percent"]), step=0.5, key="w_custom_y_percent")
     else:
-        with x_col:
-            custom_x_px = st.number_input("X (px)", -20000, 20000, int(custom_x_px), 10, key="custom_x_px")
-        with y_col:
-            custom_y_px = st.number_input("Y (px)", -20000, 20000, int(custom_y_px), 10, key="custom_y_px")
+        with xy_col1:
+            settings["custom_x_px"] = st.number_input(
+                "X (px)", -20000, 20000, value=int(settings["custom_x_px"]), step=10, key="w_custom_x_px")
+        with xy_col2:
+            settings["custom_y_px"] = st.number_input(
+                "Y (px)", -20000, 20000, value=int(settings["custom_y_px"]), step=10, key="w_custom_y_px")
     st.caption("X / Y 는 워터마크의 **왼쪽 위 모서리** 좌표입니다.")
 else:
-    margin_mode_label = st.radio(
+    settings["margin_mode"] = st.radio(
         "여백 입력 방식",
-        ["백분율(%)", "픽셀(px)"],
-        index=0 if margin_mode == "percent" else 1,
+        ["percent", "pixel"],
+        index=["percent", "pixel"].index(settings["margin_mode"]),
+        format_func=lambda key: "백분율(%)" if key == "percent" else "픽셀(px)",
+        key="w_margin_mode",
         horizontal=True,
-        key="margin_mode_label",
     )
-    margin_mode = "percent" if margin_mode_label.startswith("백분율") else "pixel"
-    x_col, y_col = st.columns(2)
-    if margin_mode == "percent":
-        with x_col:
-            margin_x_percent = st.number_input(
-                "좌우 여백 (이미지 너비의 %)", 0.0, 49.0, float(margin_x_percent), 0.1, key="margin_x_percent")
-        with y_col:
-            margin_y_percent = st.number_input(
-                "위아래 여백 (이미지 높이의 %)", 0.0, 49.0, float(margin_y_percent), 0.1, key="margin_y_percent")
+    margin_col1, margin_col2 = st.columns(2)
+    if settings["margin_mode"] == "percent":
+        with margin_col1:
+            settings["margin_x_percent"] = st.number_input(
+                "좌우 여백 (출력 너비의 %)", 0.0, 49.0,
+                value=float(settings["margin_x_percent"]), step=0.1, key="w_margin_x_percent")
+        with margin_col2:
+            settings["margin_y_percent"] = st.number_input(
+                "위아래 여백 (출력 높이의 %)", 0.0, 49.0,
+                value=float(settings["margin_y_percent"]), step=0.1, key="w_margin_y_percent")
     else:
-        with x_col:
-            margin_x_px = st.number_input("좌우 여백 (px)", 0, 20000, int(margin_x_px), 5, key="margin_x_px")
-        with y_col:
-            margin_y_px = st.number_input("위아래 여백 (px)", 0, 20000, int(margin_y_px), 5, key="margin_y_px")
-    if position == "center":
+        with margin_col1:
+            settings["margin_x_px"] = st.number_input(
+                "좌우 여백 (px)", 0, 20000, value=int(settings["margin_x_px"]), step=5, key="w_margin_x_px")
+        with margin_col2:
+            settings["margin_y_px"] = st.number_input(
+                "위아래 여백 (px)", 0, 20000, value=int(settings["margin_y_px"]), step=5, key="w_margin_y_px")
+    if settings["position"] == "center":
         st.caption("중앙 정렬에서는 여백이 사용되지 않습니다.")
 
-config = {
-    "size_mode": size_mode,
-    "size_percent": float(size_percent),
-    "size_px": int(size_px),
-    "opacity": int(opacity),
-    "position": position,
-    "margin_mode": margin_mode,
-    "margin_x_percent": float(margin_x_percent),
-    "margin_y_percent": float(margin_y_percent),
-    "margin_x_px": int(margin_x_px),
-    "margin_y_px": int(margin_y_px),
-    "custom_unit": custom_unit,
-    "custom_x_percent": float(custom_x_percent),
-    "custom_y_percent": float(custom_y_percent),
-    "custom_x_px": int(custom_x_px),
-    "custom_y_px": int(custom_y_px),
-}
+st.caption("워터마크 크기와 위치는 **최종 출력 캔버스** 기준으로 계산되므로, 원본 크기가 제각각이어도 결과에서는 항상 같은 자리·같은 크기로 보입니다.")
 
-if config != saved_config:
-    if save_config(config):
-        st.session_state.config = config
+
+# ---------------------------------------------------------------- 설정 자동 저장
+if settings != st.session_state.last_saved:
+    if save_config(settings):
+        st.session_state.last_saved = dict(settings)
     else:
-        st.warning("설정을 config.json 에 저장하지 못했습니다. (폴더 쓰기 권한 확인)")
-st.caption("바꾼 설정은 `config.json` 에 자동 저장되고, 다음에 켤 때 그대로 불러옵니다.")
+        st.warning("설정을 config.json 에 저장하지 못했습니다. (폴더 쓰기 권한을 확인해 주세요)")
 
-# 4) 미리보기 ----------------------------------------------------------------
-st.subheader("4. 미리보기")
+canvas_w, canvas_h = target_canvas(settings, (0, 0))
 
-ready = watermark_image is not None and bool(uploaded_images)
-if not ready:
-    st.info("워터마크 PNG 와 이미지를 모두 선택하면 미리보기가 나타납니다.")
+
+# ---------------------------------------------------------------- 6. 미리보기
+st.subheader("6. 미리보기")
+
+if not uploaded_images:
+    st.info("이미지를 올리면 여기에서 보정 결과를 바로 확인할 수 있습니다.")
 else:
     names = [file.name for file in uploaded_images]
-    chosen = st.selectbox("미리 볼 이미지", range(len(names)), format_func=lambda i: names[i], key="preview_index")
-    target = uploaded_images[chosen]
+    chosen = st.selectbox("미리 볼 이미지", range(len(names)), format_func=lambda i: names[i],
+                          key="w_preview_index")
+    target = uploaded_images[min(chosen, len(names) - 1)]
     try:
-        preview = process_one(target.getvalue(), target.name, watermark_image, config)
+        canvas, meta, source_size = prepare_canvas(target.getvalue(), settings)
+        edited = adjust_image(canvas, settings)
+        preview_result = compose(edited, watermark_image, settings) if watermark_image is not None else edited
+        thumb_raw, thumb_size = original_thumbnail(target.getvalue())
     except (OSError, ValueError) as error:
         st.error(f"미리보기를 만들지 못했습니다: {error}")
     else:
-        st.image(to_preview(preview["image"]), caption=f"결과 미리보기 · {preview['name']}", width="stretch")
-        st.caption(
-            f"원본 {preview['source_size'][0]} × {preview['source_size'][1]} px → "
-            f"결과 {preview['result_size'][0]} × {preview['result_size'][1]} px (크기 동일)"
-        )
+        left, right = st.columns(2)
+        with left:
+            st.image(Image.frombytes("RGBA", thumb_size, thumb_raw), width="stretch")
+            st.caption(f"**Original** · {source_size[0]} × {source_size[1]} px")
+        with right:
+            st.image(to_preview(preview_result), width="stretch")
+            st.caption(f"**Edited** · {preview_result.size[0]} × {preview_result.size[1]} px")
 
-# 5) 적용 및 다운로드 ---------------------------------------------------------
-st.subheader("5. 워터마크 적용")
+        if settings["canvas_mode"] != "original" and preview_result.size != (canvas_w, canvas_h):
+            st.error(f"출력 크기가 {canvas_w} × {canvas_h} 와 다릅니다.")
+        st.caption("미리보기는 화면 표시용으로만 줄여 보여 줍니다. 저장되는 파일은 위에 적힌 크기 그대로이고, 원본 파일은 변경되지 않습니다.")
 
-if st.button("워터마크 적용", type="primary", disabled=not ready, width="stretch"):
+
+# ---------------------------------------------------------------- 7. 일괄 처리 / 다운로드
+st.subheader("7. 전체 이미지 처리")
+
+target_text = "원본 크기 그대로" if settings["canvas_mode"] == "original" else f"{canvas_w} × {canvas_h} px"
+st.caption(f"현재 설정을 올린 이미지 전부에 똑같이 적용합니다. 출력 크기: **{target_text}**")
+
+if st.button("전체 이미지 처리", type="primary", disabled=not uploaded_images, width="stretch"):
     results, failures = [], []
     progress = st.progress(0.0, text="처리 중…")
     for index, file in enumerate(uploaded_images, start=1):
         try:
-            results.append(process_one(file.getvalue(), file.name, watermark_image, config))
+            results.append(process_one(file.getvalue(), file.name, watermark_image, settings))
         except (OSError, ValueError) as error:
             failures.append((file.name, str(error)))
         progress.progress(index / len(uploaded_images), text=f"처리 중… ({index}/{len(uploaded_images)})")
@@ -492,11 +936,14 @@ for name, message in failures:
     st.error(f"{name} : {message}")
 
 if results:
-    ok = all(item["source_size"] == item["result_size"] for item in results)
-    st.success(
-        f"{len(results)}장 완료 · "
-        + ("모든 결과가 원본과 같은 픽셀 크기입니다." if ok else "일부 이미지 크기가 다릅니다!")
-    )
+    if settings["canvas_mode"] == "original":
+        size_ok = all(item["source_size"] == item["result_size"] for item in results)
+        message = "모든 결과가 원본과 같은 픽셀 크기입니다." if size_ok else "일부 이미지 크기가 원본과 다릅니다!"
+    else:
+        size_ok = all(item["result_size"] == (canvas_w, canvas_h) for item in results)
+        message = (f"모든 결과가 정확히 {canvas_w} × {canvas_h} px 입니다." if size_ok
+                   else f"일부 이미지가 {canvas_w} × {canvas_h} 가 아닙니다!")
+    (st.success if size_ok else st.error)(f"{len(results)}장 완료 · {message}")
 
     if len(results) == 1:
         single = results[0]
@@ -511,7 +958,7 @@ if results:
         st.download_button(
             f"⬇ 전체 ZIP 다운로드 ({len(results)}장)",
             data=make_zip(results),
-            file_name="watermarked.zip",
+            file_name="edited.zip",
             mime="application/zip",
             type="primary",
             width="stretch",
@@ -523,6 +970,9 @@ if results:
                     data=item["bytes"],
                     file_name=item["name"],
                     mime=item["mime"],
-                    key=f"download_{index}",
+                    key=f"w_download_{index}",
                     width="stretch",
                 )
+
+st.divider()
+st.caption("설정(출력 방식 · 크롭 위치 · 톤/색감 값 · 워터마크 크기/투명도/위치/여백)은 바꾸는 즉시 `config.json` 에 저장되고, 다음 실행 때 그대로 불러옵니다.")
