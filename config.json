@@ -1,12 +1,11 @@
 {
-  "canvas_mode": "preset",
+  "canvas_mode": "preset_3_4",
   "canvas_w": 1080,
   "canvas_h": 1440,
-  "bg_color": "#FFFFFF",
   "fit_mode": "crop",
-  "crop_anchor": "center",
   "crop_x": 50.0,
   "crop_y": 50.0,
+  "crop_zoom": 1.0,
   "brightness": 0,
   "exposure": 0,
   "contrast": 0,
@@ -31,6 +30,8 @@
   "custom_y_percent": 88.0,
   "custom_x_px": 0,
   "custom_y_px": 0,
+  "bg_color": "#FFFFFF",
   "output_format": "jpeg",
-  "name_suffix": "_edited"
+  "name_suffix": "_edited",
+  "watermark_sync": true
 }
