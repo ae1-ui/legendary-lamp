@@ -1,0 +1,17 @@
+{
+  "size_mode": "percent",
+  "size_percent": 16.0,
+  "size_px": 300,
+  "opacity": 100,
+  "position": "bottom_right",
+  "margin_mode": "percent",
+  "margin_x_percent": 2.5,
+  "margin_y_percent": 2.0,
+  "margin_x_px": 24,
+  "margin_y_px": 24,
+  "custom_unit": "percent",
+  "custom_x_percent": 78.0,
+  "custom_y_percent": 88.0,
+  "custom_x_px": 0,
+  "custom_y_px": 0
+}
