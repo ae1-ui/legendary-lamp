@@ -20,8 +20,11 @@ import json
 import zipfile
 from pathlib import Path
 
+import base64
+
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageFilter, ImageOps
 
 try:                                        # 마우스 드래그 크롭 UI (없어도 앱은 동작한다)
@@ -39,6 +42,8 @@ SUPPORTED_TYPES = ["jpg", "jpeg", "png", "webp"]
 JPEG_QUALITY = 95
 WEBP_QUALITY = 95
 PREVIEW_MAX_SIDE = 1200
+COMPARE_MAX_SIDE = 900               # 보정 전/후 비교용 이미지 (브라우저로 보내는 크기)
+COMPARE_STAGE_HEIGHT = 545           # 비교 화면 높이(px)
 CROP_EDITOR_MAX_SIDE = 680           # 드래그 편집기에 넘길 축소본 크기
 CACHE_PIXEL_LIMIT = 6_000_000        # 이보다 큰 캔버스는 캐시하지 않는다 (메모리 보호)
 MAX_ZOOM = 12.0
@@ -695,6 +700,87 @@ def to_preview(image: Image.Image, max_side: int = PREVIEW_MAX_SIDE) -> Image.Im
     return preview
 
 
+# ---------------------------------------------------------------- 보정 전 / 후 비교
+
+def to_data_uri(image: Image.Image, background: tuple[int, int, int] = (255, 255, 255)) -> str:
+    """브라우저에 그대로 심을 수 있는 JPEG data URI 로 바꾼다."""
+    flat = flatten(image, background) if image.mode == "RGBA" else image.convert("RGB")
+    buffer = io.BytesIO()
+    flat.save(buffer, format="JPEG", quality=85, subsampling=0)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def compare_html(before_uri: str, after_uri: str, enabled: bool, stage_height: int = COMPARE_STAGE_HEIGHT) -> str:
+    """누르고 있는 동안 보정 전을 보여 주는 화면.
+
+    두 장을 미리 브라우저로 보내 놓고 CSS 로만 바꾸므로, 버튼을 누르는 즉시 전환된다
+    (서버를 다시 거치지 않는다).
+    """
+    hint = "누르고 있으면 보정 전 (이미지를 눌러도 됩니다)" if enabled else "톤·색감을 조절하면 비교할 수 있어요"
+    return f"""
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; background: transparent; }}
+  .wrap {{ display: flex; flex-direction: column; align-items: center; gap: 8px; }}
+  .stage {{ width: 100%; height: {stage_height}px;
+            display: flex; align-items: center; justify-content: center; }}
+  .holder {{ position: relative; display: inline-block; line-height: 0; }}
+  #after {{ display: block; max-width: 100%; max-height: {stage_height}px; width: auto; height: auto;
+            border-radius: 6px; user-select: none; -webkit-user-drag: none; }}
+  #before {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+             border-radius: 6px; user-select: none; -webkit-user-drag: none; opacity: 0; }}
+  .stage.compare #before {{ opacity: 1; }}
+  .stage.compare #after {{ opacity: 0; }}
+  .badge {{ position: absolute; top: 10px; left: 10px; padding: 4px 12px; border-radius: 999px;
+            font-size: 12px; font-weight: 600; letter-spacing: .02em;
+            background: rgba(17, 22, 26, .72); color: #fff; pointer-events: none; }}
+  .stage.compare .badge {{ background: rgba(196, 92, 24, .88); }}
+  button {{ font: inherit; font-size: 14px; font-weight: 600; padding: 8px 20px; border: 0;
+            border-radius: 8px; background: #2b3238; color: #fff; cursor: pointer;
+            user-select: none; -webkit-tap-highlight-color: transparent; }}
+  button:active {{ background: #55616b; }}
+  button:disabled {{ background: #9aa4ac; cursor: default; }}
+  button:focus-visible {{ outline: 2px solid #4fc2ce; outline-offset: 2px; }}
+</style>
+<div class="wrap">
+  <button id="hold" {"" if enabled else "disabled"}>👁 {hint}</button>
+  <div class="stage" id="stage">
+    <div class="holder">
+      <img id="after" src="{after_uri}" alt="보정 후">
+      <img id="before" src="{before_uri}" alt="보정 전">
+      <span class="badge" id="badge">보정 후</span>
+    </div>
+  </div>
+</div>
+<script>
+  const stage = document.getElementById('stage');
+  const badge = document.getElementById('badge');
+  const hold = document.getElementById('hold');
+  const enabled = {"true" if enabled else "false"};
+  function showBefore() {{
+    if (!enabled) return;
+    stage.classList.add('compare');
+    badge.textContent = '보정 전 (원본 색감)';
+  }}
+  function showAfter() {{
+    stage.classList.remove('compare');
+    badge.textContent = '보정 후';
+  }}
+  for (const el of [hold, stage]) {{
+    el.addEventListener('mousedown', (e) => {{ e.preventDefault(); showBefore(); }});
+    el.addEventListener('touchstart', (e) => {{ e.preventDefault(); showBefore(); }}, {{ passive: false }});
+  }}
+  for (const type of ['mouseup', 'mouseleave', 'touchend', 'touchcancel']) {{
+    document.addEventListener(type, showAfter);
+  }}
+  window.addEventListener('blur', showAfter);
+  hold.addEventListener('keydown', (e) => {{ if (e.key === ' ' || e.key === 'Enter') {{ e.preventDefault(); showBefore(); }} }});
+  hold.addEventListener('keyup', (e) => {{ if (e.key === ' ' || e.key === 'Enter') showAfter(); }});
+</script>
+"""
+
+
 # ---------------------------------------------------------------- 화면
 #
 # 레이아웃: 위쪽에 업로드, 그 아래 [왼쪽 60 = 미리보기(sticky) | 오른쪽 40 = 편집 설정],
@@ -1175,7 +1261,18 @@ with preview_col:
                         st.markdown("**저장될 결과**")
                         st.image(to_preview(preview_result, 520))
                     else:
-                        st.image(to_preview(preview_result), width="stretch")
+                        # 보정 전(톤·색감만 0으로 되돌린 같은 화면)을 함께 보내, 버튼을 누르는 동안
+                        # 서버를 다시 거치지 않고 바로 바꿔 볼 수 있게 한다.
+                        can_compare = has_adjustments(effective)
+                        after_uri = to_data_uri(to_preview(preview_result, COMPARE_MAX_SIDE))
+                        if can_compare:
+                            neutral = {**effective, **{name: 0 for name in ADJUSTMENT_KEYS}}
+                            before_result, _m, _s, _r = render_result(data, watermark_image, neutral)
+                            before_uri = to_data_uri(to_preview(before_result, COMPARE_MAX_SIDE))
+                        else:
+                            before_uri = after_uri
+                        components.html(compare_html(before_uri, after_uri, can_compare),
+                                        height=COMPARE_STAGE_HEIGHT + 60)
                     st.caption(f"Edited · {preview_result.size[0]} × {preview_result.size[1]} px "
                                f"· 원본 {source_size[0]} × {source_size[1]} px 에서 만들어진 최종 결과")
                     if effective["canvas_mode"] != "original" and preview_result.size != (canvas_w, canvas_h):
