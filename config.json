@@ -32,6 +32,5 @@
   "custom_y_px": 0,
   "bg_color": "#FFFFFF",
   "output_format": "jpeg",
-  "name_suffix": "_edited",
-  "watermark_sync": true
+  "name_suffix": "_edited"
 }

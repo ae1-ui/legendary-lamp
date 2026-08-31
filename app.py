@@ -9,8 +9,8 @@
   6. 파일 저장
 
 설정은 두 종류입니다.
-  · 이미지별 설정 - 출력 크기 · 맞춤 방식 · 크롭 위치 · 톤 · 색감 · 워터마크 (사진마다 따로 저장)
-  · 공통 설정     - 배경색 · 저장 형식 · 파일 이름 · 워터마크 동일 적용 여부
+  · 이미지별 설정 - 출력 크기 · 맞춤 방식 · 크롭 위치 · 톤 · 색감 (사진마다 따로 저장)
+  · 공통 설정     - 워터마크 · 배경색 · 저장 형식 · 파일 이름 (모든 사진에 똑같이 적용)
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ DEFAULTS = {
     "tint": 0,                        # 음수=green, 양수=magenta
     "sharpness": 0,                   # 음수=부드럽게, 양수=선명하게
 
-    # --- 이미지별: 워터마크 ---
+    # --- 공통: 워터마크 (모든 사진에 같은 위치·크기로 들어간다) ---
     "size_mode": "percent",           # "percent" | "pixel"
     "size_percent": 25.0,             # 출력 캔버스 너비 대비 %
     "size_px": 300,
@@ -102,7 +102,6 @@ DEFAULTS = {
     "bg_color": "#FFFFFF",
     "output_format": "jpeg",          # "jpeg" | "keep"(원본 형식 유지)
     "name_suffix": "_edited",
-    "watermark_sync": True,           # 워터마크를 모든 사진에 동일하게 맞출지
 }
 
 # 톤·색감 보정값. "보정 초기화" 와 "전체 이미지에 적용" 의 대상이다 (크롭 위치는 제외).
@@ -117,10 +116,10 @@ WATERMARK_KEYS = (
     "custom_unit", "custom_x_percent", "custom_y_percent", "custom_x_px", "custom_y_px",
 )
 
-# 사진마다 따로 저장되는 값. 나머지(배경색·저장 옵션)는 공통 설정이다.
+# 사진마다 따로 저장되는 값. 워터마크·배경색·저장 옵션은 공통 설정이라 여기에 없다.
 PER_IMAGE_KEYS = (
     ("canvas_mode", "canvas_w", "canvas_h", "fit_mode", "crop_x", "crop_y", "crop_zoom")
-    + ADJUSTMENT_KEYS + WATERMARK_KEYS
+    + ADJUSTMENT_KEYS
 )
 
 # 새로 올린 사진은 톤·색감·크롭을 항상 "손대지 않은 상태" 로 시작한다.
@@ -226,7 +225,6 @@ def load_config() -> dict:
         "bg_color": _as_hex_color(raw.get("bg_color"), d["bg_color"]),
         "output_format": _as_choice(raw.get("output_format"), ("jpeg", "keep"), d["output_format"]),
         "name_suffix": str(raw.get("name_suffix", d["name_suffix"]))[:40] or d["name_suffix"],
-        "watermark_sync": bool(raw.get("watermark_sync", d["watermark_sync"])),
     }
     for key in ADJUSTMENT_KEYS:
         config[key] = _as_int(raw.get(key), d[key], -100, 100)
@@ -704,7 +702,7 @@ def to_preview(image: Image.Image, max_side: int = PREVIEW_MAX_SIDE) -> Image.Im
 #
 # 설정 저장 방식
 #   · 이미지별 설정 - st.session_state.image_settings[이미지키] (PER_IMAGE_KEYS)
-#   · 공통 설정     - st.session_state.settings (배경색 · 저장 옵션 · 워터마크 동일 적용)
+#   · 공통 설정     - st.session_state.settings (워터마크 · 배경색 · 저장 옵션)
 #   위젯에는 value= / index= 로 값을 넣고, 위젯 키는 "w_" 접두사(이미지별은 "__이미지키" 접미사)로
 #   분리한다. 이미지마다 위젯 키가 달라지므로 사진 사이에 값이 섞이지 않는다.
 
@@ -899,7 +897,7 @@ with control_col:
         current_key = image_key(selected_file)
         st.session_state.current_image_key = current_key
         current = ensure_image_settings(current_key)
-        st.caption("아래 2~6번은 **이 사진에만** 적용되는 개별 설정입니다.")
+        st.caption("아래 2~5번은 **이 사진에만** 적용되는 개별 설정이고, 6번 워터마크는 **모든 사진 공통**입니다.")
     else:
         selected_file, current_key, current = None, None, None
         st.session_state.current_image_key = None
@@ -993,7 +991,7 @@ with control_col:
     adjustment_slider("Sharpness 선명도", "sharpness", "음수 = 부드럽게, 양수 = 또렷하게")
 
     # --- 6. 워터마크 설정 -------------------------------------------------------
-    section(6, "워터마크 설정")
+    section(6, "워터마크 설정 (모든 사진 공통)")
 
     uploaded_watermark = st.file_uploader(
         "워터마크 PNG (투명 배경 · 모든 사진 공통)", type=["png"], key="w_watermark_file"
@@ -1016,85 +1014,75 @@ with control_col:
     else:
         st.warning("워터마크 PNG 가 없습니다. 이대로 진행하면 보정만 적용됩니다.")
 
-    settings["watermark_sync"] = st.toggle(
-        "워터마크 설정을 모든 사진에 동일하게 적용",
-        value=bool(settings["watermark_sync"]), key="w_watermark_sync",
-        help="켜 두면 결과물마다 워터마크가 같은 자리·같은 크기로 들어갑니다. "
-             "끄면 사진마다 다르게 둘 수 있습니다.")
-
-
     def watermark_widget(name: str, render):
-        """워터마크 값도 이미지별로 저장한다 (동일 적용이 켜져 있으면 뒤에서 전부에 복사)."""
-        if current is None:
-            return
-        current[name] = render(widget_key(name, current_key), current[name])
+        """워터마크는 공통 설정이라 사진과 무관하게 하나의 값만 쓴다."""
+        settings[name] = render("w_" + name, settings[name])
 
-    if current is not None:
-        watermark_widget("position", lambda key, value: st.selectbox(
-            "위치", POSITION_KEYS, index=POSITION_KEYS.index(value),
-            format_func=lambda k: POSITION_LABELS[k], key=key))
+    watermark_widget("position", lambda key, value: st.selectbox(
+        "위치", POSITION_KEYS, index=POSITION_KEYS.index(value),
+        format_func=lambda k: POSITION_LABELS[k], key=key))
 
-        watermark_widget("size_mode", lambda key, value: st.radio(
-            "크기 기준", ["percent", "pixel"], index=["percent", "pixel"].index(value),
-            format_func=lambda k: "출력 너비 대비 %" if k == "percent" else "픽셀(px)",
+    watermark_widget("size_mode", lambda key, value: st.radio(
+        "크기 기준", ["percent", "pixel"], index=["percent", "pixel"].index(value),
+        format_func=lambda k: "출력 너비 대비 %" if k == "percent" else "픽셀(px)",
+        key=key, horizontal=True))
+
+    if settings["size_mode"] == "percent":
+        watermark_widget("size_percent", lambda key, value: st.slider(
+            "크기 (출력 너비의 %)", 1.0, 100.0, value=float(value), step=0.5, key=key))
+    else:
+        watermark_widget("size_px", lambda key, value: st.number_input(
+            "크기 (px)", 1, 20000, value=int(value), step=10, key=key))
+
+    watermark_widget("opacity", lambda key, value: st.slider(
+        "투명도 (%)", 0, 100, value=int(value), key=key,
+        help="100 = 원본 PNG 그대로, 0 = 완전히 투명"))
+
+    if settings["position"] == "custom":
+        watermark_widget("custom_unit", lambda key, value: st.radio(
+            "X / Y 입력 방식", ["percent", "pixel"], index=["percent", "pixel"].index(value),
+            format_func=lambda k: "백분율(%)" if k == "percent" else "픽셀(px)",
             key=key, horizontal=True))
-
-        if current["size_mode"] == "percent":
-            watermark_widget("size_percent", lambda key, value: st.slider(
-                "크기 (출력 너비의 %)", 1.0, 100.0, value=float(value), step=0.5, key=key))
+        xy_col1, xy_col2 = st.columns(2)
+        if settings["custom_unit"] == "percent":
+            with xy_col1:
+                watermark_widget("custom_x_percent", lambda key, value: st.number_input(
+                    "X (출력 너비의 %)", -100.0, 200.0, value=float(value), step=0.5, key=key))
+            with xy_col2:
+                watermark_widget("custom_y_percent", lambda key, value: st.number_input(
+                    "Y (출력 높이의 %)", -100.0, 200.0, value=float(value), step=0.5, key=key))
         else:
-            watermark_widget("size_px", lambda key, value: st.number_input(
-                "크기 (px)", 1, 20000, value=int(value), step=10, key=key))
-
-        watermark_widget("opacity", lambda key, value: st.slider(
-            "투명도 (%)", 0, 100, value=int(value), key=key,
-            help="100 = 원본 PNG 그대로, 0 = 완전히 투명"))
-
-        if current["position"] == "custom":
-            watermark_widget("custom_unit", lambda key, value: st.radio(
-                "X / Y 입력 방식", ["percent", "pixel"], index=["percent", "pixel"].index(value),
-                format_func=lambda k: "백분율(%)" if k == "percent" else "픽셀(px)",
-                key=key, horizontal=True))
-            xy_col1, xy_col2 = st.columns(2)
-            if current["custom_unit"] == "percent":
-                with xy_col1:
-                    watermark_widget("custom_x_percent", lambda key, value: st.number_input(
-                        "X (출력 너비의 %)", -100.0, 200.0, value=float(value), step=0.5, key=key))
-                with xy_col2:
-                    watermark_widget("custom_y_percent", lambda key, value: st.number_input(
-                        "Y (출력 높이의 %)", -100.0, 200.0, value=float(value), step=0.5, key=key))
-            else:
-                with xy_col1:
-                    watermark_widget("custom_x_px", lambda key, value: st.number_input(
-                        "X (px)", -20000, 20000, value=int(value), step=10, key=key))
-                with xy_col2:
-                    watermark_widget("custom_y_px", lambda key, value: st.number_input(
-                        "Y (px)", -20000, 20000, value=int(value), step=10, key=key))
-            st.caption("X / Y 는 워터마크의 **왼쪽 위 모서리** 좌표입니다.")
+            with xy_col1:
+                watermark_widget("custom_x_px", lambda key, value: st.number_input(
+                    "X (px)", -20000, 20000, value=int(value), step=10, key=key))
+            with xy_col2:
+                watermark_widget("custom_y_px", lambda key, value: st.number_input(
+                    "Y (px)", -20000, 20000, value=int(value), step=10, key=key))
+        st.caption("X / Y 는 워터마크의 **왼쪽 위 모서리** 좌표입니다.")
+    else:
+        watermark_widget("margin_mode", lambda key, value: st.radio(
+            "여백 입력 방식", ["percent", "pixel"], index=["percent", "pixel"].index(value),
+            format_func=lambda k: "백분율(%)" if k == "percent" else "픽셀(px)",
+            key=key, horizontal=True))
+        margin_col1, margin_col2 = st.columns(2)
+        if settings["margin_mode"] == "percent":
+            with margin_col1:
+                watermark_widget("margin_x_percent", lambda key, value: st.number_input(
+                    "Margin X (출력 너비의 %)", 0.0, 49.0, value=float(value), step=0.1, key=key))
+            with margin_col2:
+                watermark_widget("margin_y_percent", lambda key, value: st.number_input(
+                    "Margin Y (출력 높이의 %)", 0.0, 49.0, value=float(value), step=0.1, key=key))
         else:
-            watermark_widget("margin_mode", lambda key, value: st.radio(
-                "여백 입력 방식", ["percent", "pixel"], index=["percent", "pixel"].index(value),
-                format_func=lambda k: "백분율(%)" if k == "percent" else "픽셀(px)",
-                key=key, horizontal=True))
-            margin_col1, margin_col2 = st.columns(2)
-            if current["margin_mode"] == "percent":
-                with margin_col1:
-                    watermark_widget("margin_x_percent", lambda key, value: st.number_input(
-                        "Margin X (출력 너비의 %)", 0.0, 49.0, value=float(value), step=0.1, key=key))
-                with margin_col2:
-                    watermark_widget("margin_y_percent", lambda key, value: st.number_input(
-                        "Margin Y (출력 높이의 %)", 0.0, 49.0, value=float(value), step=0.1, key=key))
-            else:
-                with margin_col1:
-                    watermark_widget("margin_x_px", lambda key, value: st.number_input(
-                        "Margin X (px)", 0, 20000, value=int(value), step=5, key=key))
-                with margin_col2:
-                    watermark_widget("margin_y_px", lambda key, value: st.number_input(
-                        "Margin Y (px)", 0, 20000, value=int(value), step=5, key=key))
-            if current["position"] == "center":
-                st.caption("중앙 정렬에서는 여백이 사용되지 않습니다.")
+            with margin_col1:
+                watermark_widget("margin_x_px", lambda key, value: st.number_input(
+                    "Margin X (px)", 0, 20000, value=int(value), step=5, key=key))
+            with margin_col2:
+                watermark_widget("margin_y_px", lambda key, value: st.number_input(
+                    "Margin Y (px)", 0, 20000, value=int(value), step=5, key=key))
+        if settings["position"] == "center":
+            st.caption("중앙 정렬에서는 여백이 사용되지 않습니다.")
 
-        st.caption("워터마크 크기와 위치는 **최종 출력 캔버스** 기준이라, 원본 비율이 달라도 결과에서는 같은 자리에 같은 크기로 들어갑니다.")
+    st.caption("워터마크는 **모든 사진에 똑같이** 들어갑니다. 크기와 위치는 최종 출력 캔버스 기준으로 계산되므로, 사진마다 원본 비율이나 출력 크기가 달라도 결과에서 차지하는 비율과 자리는 같습니다.")
 
     # --- 7. 보정 초기화 ---------------------------------------------------------
     section(7, "보정 초기화")
@@ -1111,13 +1099,6 @@ with control_col:
     copied = st.session_state.pop("apply_all_notice", None)
     if copied:
         st.success(f"다른 이미지 {copied}장에 톤 · 색감 · Sharpness 를 복사했습니다.", icon="📋")
-
-# ---------------------------------------------------------------- 워터마크 동일 적용
-if current is not None and settings["watermark_sync"]:
-    for other, values in st.session_state.image_settings.items():
-        if other != current_key:
-            for name in WATERMARK_KEYS:
-                values[name] = current[name]
 
 # ================================================================= 왼쪽: 미리보기 (sticky)
 with preview_col:
@@ -1276,6 +1257,6 @@ if results:
                     width="stretch",
                 )
 
-st.caption("사진별 설정은 앱을 켜 둔 동안 사진마다 따로 유지됩니다. 다음 실행 때는 출력 크기 · 맞춤 방식 · "
-           "워터마크 · 저장 옵션이 `config.json` 에서 그대로 복원되고, 톤 · 색감 · 크롭 위치는 사진마다 "
-           "손대지 않은 상태(0 · 가운데)에서 시작합니다.")
+st.caption("워터마크는 모든 사진에 같은 위치·크기로 들어가고, 톤 · 색감 · 크롭은 사진마다 따로 유지됩니다. "
+           "다음 실행 때는 워터마크 · 출력 크기 · 맞춤 방식 · 저장 옵션이 `config.json` 에서 그대로 복원되고, "
+           "톤 · 색감 · 크롭 위치는 사진마다 손대지 않은 상태(0 · 가운데)에서 시작합니다.")
