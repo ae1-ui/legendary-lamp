@@ -1,0 +1,13 @@
+# 설치 스크립트가 만드는 실행 앱 (컴퓨터마다 경로가 달라 저장소에는 넣지 않습니다)
+워터마크 툴.app/
+워터마크 툴 종료.app/
+mac/icon.icns
+
+# 실행 중 생기는 파일
+.watermark-tool.log
+.watermark-tool.pid
+.watermark-tool.port
+
+__pycache__/
+*.pyc
+.DS_Store
