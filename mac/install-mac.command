@@ -88,7 +88,36 @@ fi
 # ---------------------------------------------------------------- 3. 앱 만들기
 step "3/4  실행 앱 만들기"
 
-make_bundle() {           # $1 = 앱 이름, $2 = 설명, $3 = 실행 스크립트 파일
+# 맥에서는 애플 기본 도구인 osacompile 로 앱을 만든다.
+# 직접 조립한 앱 번들은 서명이 없어 Finder 가 실행을 거부하는 경우가 있는데,
+# osacompile 이 만든 앱은 애플이 서명한 실행 파일(applet)을 쓰므로 그냥 열린다.
+make_bundle_applescript() {   # $1 = 앱 이름, $3 = 실행 스크립트 파일
+    local name="$1" script="$3"
+    local bundle="$PROJECT_DIR/$name.app"
+    rm -rf "$bundle"
+
+    cat > "$TMP_DIR/applet.applescript" <<'APPLESCRIPT'
+on run
+    try
+        set appPath to POSIX path of (path to me)
+        with timeout of 300 seconds
+            do shell script "/bin/bash " & quoted form of (appPath & "Contents/Resources/run.sh")
+        end timeout
+    end try
+end run
+APPLESCRIPT
+
+    osacompile -o "$bundle" "$TMP_DIR/applet.applescript" || return 1
+    cp "$script" "$bundle/Contents/Resources/run.sh"
+    chmod 755 "$bundle/Contents/Resources/run.sh"
+    [ -f "$PROJECT_DIR/mac/icon.icns" ] && cp "$PROJECT_DIR/mac/icon.icns" "$bundle/Contents/Resources/applet.icns"
+    xattr -cr "$bundle" 2>/dev/null
+    touch "$bundle"
+    ok "$name.app"
+    return 0
+}
+
+make_bundle_manual() {    # osacompile 이 없는 환경(테스트용)에서 쓰는 예비 방식
     local name="$1" desc="$2" script="$3"
     local bundle="$PROJECT_DIR/$name.app"
     rm -rf "$bundle"
@@ -120,8 +149,17 @@ PLIST
 
     # 다운로드 표식(격리 속성)을 떼어 "확인되지 않은 개발자" 경고를 막는다
     command -v xattr >/dev/null 2>&1 && xattr -cr "$bundle" 2>/dev/null
+    command -v codesign >/dev/null 2>&1 && codesign --force --sign - "$bundle" >/dev/null 2>&1
+    command -v touch >/dev/null 2>&1 && touch "$bundle"
     [ -f "$PROJECT_DIR/mac/icon.icns" ] && cp "$PROJECT_DIR/mac/icon.icns" "$bundle/Contents/Resources/icon.icns"
-    ok "$name.app"
+    ok "$name.app  (예비 방식)"
+}
+
+make_bundle() {
+    if command -v osacompile >/dev/null 2>&1 && make_bundle_applescript "$@"; then
+        return 0
+    fi
+    make_bundle_manual "$@"
 }
 
 TMP_DIR="$(mktemp -d)"
@@ -391,6 +429,9 @@ say "   ▶  $APP_NAME.app          더블클릭 → 프로그램 실행"
 say "   ■  $QUIT_NAME.app     더블클릭 → 프로그램 종료"
 say ""
 say "자주 쓰시려면 '$APP_NAME.app' 을 독(Dock)으로 끌어다 놓으세요."
+say ""
+say "혹시 더블클릭해도 안 열리면, 터미널에 아래를 붙여 넣어 무슨 일인지 확인할 수 있습니다."
+say "   open \"$PROJECT_DIR/$APP_NAME.app\""
 say ""
 command -v open >/dev/null 2>&1 && open "$PROJECT_DIR"
 say "이 창은 닫으셔도 됩니다."
